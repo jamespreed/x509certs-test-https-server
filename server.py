@@ -3,9 +3,11 @@ from collections import namedtuple
 from pathlib import Path
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import atexit
 
 import trustme
 import ssl
+import requests
 
 
 CertPaths = namedtuple(
@@ -29,6 +31,9 @@ class EchoHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b'ECHO:POST=' + body)
 
+    def log_request(self, *args, **kwargs):
+        pass
+
 
 def create_test_certificates(*hosts: str) -> CertPaths:
     """Creates a CA certificate, server certificate, and client certificate
@@ -47,7 +52,7 @@ def create_test_certificates(*hosts: str) -> CertPaths:
     cert_temp_dir = tempfile.TemporaryDirectory()
     cert_temp_dir_path = Path(cert_temp_dir.name)
 
-    ca = trustme.CA('test-CA')
+    ca = trustme.CA(organization_name='test-CA')
     server_cert = ca.issue_cert(*hosts, organization_name='test-org')
     client_cert = ca.issue_cert(*('client@' + h for h in hosts))
 
@@ -60,11 +65,13 @@ def create_test_certificates(*hosts: str) -> CertPaths:
     client_cert.private_key_and_cert_chain_pem.write_to_path(client_cert_path)
 
     certs = CertPaths(
-        cert_temp_dir_path.as_posix(),
+        cert_temp_dir,
         ca_path.as_posix(),
         server_cert_path.as_posix(),
         client_cert_path.as_posix()
     )
+
+    atexit.register(cert_temp_dir.cleanup)
 
     return certs
 
@@ -114,6 +121,7 @@ def secure_server_socket(httpd: HTTPServer,
         certfile=cert_path, 
         keyfile=key_path,
         ca_certs=ca_path,
+        cert_reqs= ssl.CERT_REQUIRED,
         server_side=True
     )
     return httpd
@@ -132,7 +140,39 @@ def start_server_thread(httpd:HTTPServer) -> Thread:
 
 def main_example():
     """Example script of starting creating certs, using them to secure a
-    server, launch the server, and make requests using the client cert."""
+    server, launch the server, and make requests using the client cert.
+    """
+    certs = create_test_certificates()
+    
+    server = secure_server_socket(
+        create_http_server(), 
+        cert_path=certs.server, 
+        ca_path=certs.ca,
+    )
+
+    host, port = server.server_address
+    url = f'https://{host}:{port}'
+
+    sess = requests.Session()
+    sess.cert = certs.client
+    sess.verify = certs.ca
+
+    atexit.register(server.shutdown)
+
+    print(f'Starting server at {url}')
+    start_server_thread(server)
+
+    print(f'Sending GET request...')
+    res = sess.get(url)
+    print(f'Received GET response:\n<{res.status_code}>', res.content.decode())
+
+    print(f'Sending POST request, body="hello world!"...')
+    res = sess.post(url, data='hello world!')
+    print(f'Received POST response:\n<{res.status_code}>', res.content.decode())
+
+    return 0
 
 if __name__ == '__main__':
-    main_example()
+    import sys
+
+    sys.exit(main_example())
